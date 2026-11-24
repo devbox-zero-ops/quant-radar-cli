@@ -140,6 +140,7 @@ def fetch_hyperliquid_funding(min_oi_usd: float = 500_000.0, min_vol_usd: float 
         "top_cross_venue_arb": cross_top[:12],
         "top_single_hl_funding": single_top[:12],
         "all_cross_venue_by_symbol": {r["symbol"]: r for r in rows if r.get("best_cross_arb")},
+        "all_predicted_venues": pred_map,
     }
 
 
@@ -233,11 +234,13 @@ def fetch_polymarket_opportunities(limit_events: int = 40, min_vol_usd: float = 
     return analyze_polymarket_events(events, min_vol_usd=min_vol_usd)
 
 
-def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equity: float = 1000.0, max_positions: int = 3, min_entry_apr: float = 25.0, exit_apr: float = 8.0, rt_fee_bps: float = DEFAULT_CROSS_VENUE_RT_BPS):
+def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equity: float = 1000.0, max_positions: int = 3, min_entry_apr: float = 25.0, exit_apr: float = 8.0, rt_fee_bps: float = DEFAULT_CROSS_VENUE_RT_BPS, confirm_exit_ticks: int = 2):
     """
     Maintain a realistic delta-neutral cross-venue funding paper portfolio on disk.
     - Deducts half of round-trip taker fee on open and half on close.
     - Accrues real funding spread cashflow strictly over real wall-clock elapsed hours.
+    - Requires `confirm_exit_ticks` consecutive valid ticks below `exit_apr` before closing
+      to avoid whipsaw exits on UTC funding-interval rollover resets; never closes on missing quotes.
     - Zero real funds risked; strictly empirical strategy validation.
     """
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -264,21 +267,31 @@ def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equ
         by_sym.setdefault(r["symbol"], r)
     for r in funding_snapshot.get("top_single_hl_funding", []):
         by_sym.setdefault(r["symbol"], r)
+    pred_venues = funding_snapshot.get("all_predicted_venues") or {}
 
-    # 1. Accrue real-time funding & check exit threshold on open positions
+    # 1. Accrue real-time funding & check hysteresis-confirmed exit threshold on open positions
     to_close = []
     for sym, pos in state["open_positions"].items():
         elapsed_h = max(0.0, (now_ts - pos["last_mark_ts"]) / 3600.0)
         cur = by_sym.get(sym)
-        cur_spread_apr = 0.0
-        if cur and isinstance(cur.get("venues"), dict) and pos["long_venue"] in cur["venues"] and pos["short_venue"] in cur["venues"]:
-            cur_spread_apr = round(cur["venues"][pos["short_venue"]]["apr_pct"] - cur["venues"][pos["long_venue"]]["apr_pct"], 2)
+        venues_map = (cur.get("venues") if (cur and isinstance(cur.get("venues"), dict)) else None) or pred_venues.get(sym)
+        cur_spread_apr = None
+        if isinstance(venues_map, dict) and pos["long_venue"] in venues_map and pos["short_venue"] in venues_map:
+            cur_spread_apr = round(venues_map[pos["short_venue"]]["apr_pct"] - venues_map[pos["long_venue"]]["apr_pct"], 2)
         elif cur and cur.get("best_cross_arb"):
             arb = cur["best_cross_arb"]
             if arb["long_venue"] == pos["long_venue"] and arb["short_venue"] == pos["short_venue"]:
                 cur_spread_apr = arb["spread_apr_pct"]
             elif arb["long_venue"] == pos["short_venue"] and arb["short_venue"] == pos["long_venue"]:
                 cur_spread_apr = -arb["spread_apr_pct"]
+
+        if cur_spread_apr is None:
+            pos["missing_quote_ticks"] = int(pos.get("missing_quote_ticks", 0)) + 1
+            pos["last_mark_ts"] = now_ts
+            pos["last_mark_utc"] = now_iso
+            continue
+
+        pos["missing_quote_ticks"] = 0
         accrued = pos["notional_usd"] * (cur_spread_apr / 100.0) * (elapsed_h / (365.0 * 24.0))
         pos["accrued_funding_usd"] = round(pos["accrued_funding_usd"] + accrued, 6)
         pos["last_mark_ts"] = now_ts
@@ -286,7 +299,12 @@ def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equ
         pos["last_spread_apr_pct"] = cur_spread_apr
         state["total_funding_accrued_usd"] = round(state["total_funding_accrued_usd"] + accrued, 6)
         if cur_spread_apr < exit_apr:
-            to_close.append((sym, f"spread dropped to {cur_spread_apr}% < {exit_apr}%"))
+            low_ticks = int(pos.get("below_exit_ticks", 0)) + 1
+            pos["below_exit_ticks"] = low_ticks
+            if low_ticks >= max(1, int(confirm_exit_ticks)):
+                to_close.append((sym, f"spread stayed below {exit_apr}% for {low_ticks} ticks (last {cur_spread_apr}%)"))
+        else:
+            pos["below_exit_ticks"] = 0
 
     half_fee_rate = (rt_fee_bps / 2.0) / 10000.0
     for sym, reason in to_close:
@@ -555,6 +573,7 @@ def main():
     p_sim.add_argument("--equity", type=float, default=1000.0)
     p_sim.add_argument("--min-apr", type=float, default=25.0)
     p_sim.add_argument("--exit-apr", type=float, default=8.0)
+    p_sim.add_argument("--confirm-exit-ticks", type=int, default=2)
 
     p_d = sub.add_parser("digest")
     p_d.add_argument("--json", action="store_true")
@@ -577,7 +596,7 @@ def main():
         print(json.dumps(fetch_polymarket_opportunities(args.limit, args.min_vol), ensure_ascii=False, indent=2))
     elif args.cmd == "paper":
         snap = fetch_hyperliquid_funding()
-        st = update_paper_portfolio(args.ledger, snap, virtual_equity=args.equity, min_entry_apr=args.min_apr, exit_apr=args.exit_apr)
+        st = update_paper_portfolio(args.ledger, snap, virtual_equity=args.equity, min_entry_apr=args.min_apr, exit_apr=args.exit_apr, confirm_exit_ticks=args.confirm_exit_ticks)
         print(json.dumps(st, ensure_ascii=False, indent=2))
     elif args.cmd == "digest":
         f_snap = fetch_hyperliquid_funding()
