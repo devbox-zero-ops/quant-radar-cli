@@ -6,6 +6,7 @@ Zero-dependency Python CLI for real-time **cross-venue crypto perpetual funding 
 - **Zero API keys required** — queries public read-only Hyperliquid Mainnet & Polymarket Gamma APIs.
 - **Fee-adjusted math** — automatically computes round-trip taker fee break-even hours and liquidity filters (`min_oi`, `min_vol`).
 - **Persistent paper-trading ledger** — tracks virtual positions, entry/exit fees, real elapsed hourly funding accrual, and mark-to-market net return before committing live capital.
+- **Anti-spam Webhook & Telegram alerting (`notify`)** — filters high-spread funding & Polymarket signals with configurable per-key cooldown state files for 24/7 cron monitoring.
 
 ## Quick Start
 
@@ -21,6 +22,12 @@ python radar.py digest
 
 # 4. Run persistent delta-neutral paper-trading simulation ($0 real funds)
 python radar.py paper --equity 1000 --min-apr 25 --exit-apr 8
+
+# 5. Preview or dispatch threshold alerts with 60-minute anti-spam cooldown (Webhook / Telegram)
+python radar.py notify --min-spread-apr 60 --max-breakeven-hours 36 --cooldown-min 60 --dry-run
+# Live delivery via env vars (Discord/Slack/custom webhook or Telegram Bot API):
+# QUANT_RADAR_WEBHOOK="https://..." python radar.py notify --min-spread-apr 60
+# TELEGRAM_BOT_TOKEN="..." TELEGRAM_CHAT_ID="..." python radar.py notify --min-spread-apr 60
 ```
 
 ## Verify Locally
