@@ -271,7 +271,9 @@ def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equ
         elapsed_h = max(0.0, (now_ts - pos["last_mark_ts"]) / 3600.0)
         cur = by_sym.get(sym)
         cur_spread_apr = 0.0
-        if cur and cur.get("best_cross_arb"):
+        if cur and isinstance(cur.get("venues"), dict) and pos["long_venue"] in cur["venues"] and pos["short_venue"] in cur["venues"]:
+            cur_spread_apr = round(cur["venues"][pos["short_venue"]]["apr_pct"] - cur["venues"][pos["long_venue"]]["apr_pct"], 2)
+        elif cur and cur.get("best_cross_arb"):
             arb = cur["best_cross_arb"]
             if arb["long_venue"] == pos["long_venue"] and arb["short_venue"] == pos["short_venue"]:
                 cur_spread_apr = arb["spread_apr_pct"]
