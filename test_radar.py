@@ -59,10 +59,23 @@ try:
     }
     st1 = radar.update_paper_portfolio(ledger, snap_open, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0)
     assert "TEST" in st1["open_positions"] and st1["total_fees_paid_usd"] > 0
-    # Simulate 24h elapsed and spread collapsing below exit_apr
-    st1["open_positions"]["TEST"]["last_mark_ts"] -= 24 * 3600
+    # Verify a held symbol outside top_cross_venue_arb[:12] is still marked via all_cross_venue_by_symbol
+    st1["open_positions"]["TEST"]["last_mark_ts"] -= 12 * 3600
     with open(ledger, "w", encoding="utf-8") as f:
         json.dump(st1, f)
+    snap_mid = {
+        "top_cross_venue_arb": [],
+        "top_single_hl_funding": [],
+        "all_cross_venue_by_symbol": {
+            "TEST": {"symbol": "TEST", "best_cross_arb": {"long_venue": "BybitPerp", "short_venue": "HlPerp", "spread_apr_pct": 40.0, "breakeven_hours": 39.42}}
+        },
+    }
+    st_mid = radar.update_paper_portfolio(ledger, snap_mid, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0)
+    assert "TEST" in st_mid["open_positions"] and st_mid["open_positions"]["TEST"]["accrued_funding_usd"] > 0
+    # Simulate 24h elapsed and spread collapsing below exit_apr
+    st_mid["open_positions"]["TEST"]["last_mark_ts"] -= 24 * 3600
+    with open(ledger, "w", encoding="utf-8") as f:
+        json.dump(st_mid, f)
     snap_close = {
         "top_cross_venue_arb": [
             {"symbol": "TEST", "best_cross_arb": {"long_venue": "BybitPerp", "short_venue": "HlPerp", "spread_apr_pct": 2.0, "breakeven_hours": 788.4}}
