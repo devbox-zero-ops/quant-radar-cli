@@ -86,6 +86,30 @@ try:
     assert "TEST" not in st2["open_positions"] and len(st2["closed_trades"]) == 1
     assert st2["closed_trades"][0]["exit_fee_usd"] > 0
     print("  Paper-trading lifecycle OK: closed net_pnl=", st2["closed_trades"][0]["net_pnl_usd"])
+
+    print("3b. Unit test alert selection, cooldown suppression & dry-run dispatch...")
+    mock_f = {
+        "observed_utc": "2026-11-24T09:00:00Z",
+        "top_cross_venue_arb": [
+            {"symbol": "HIGH", "oi_usd": 4_000_000, "best_cross_arb": {"long_venue": "BinPerp", "short_venue": "HlPerp", "spread_apr_pct": 110.0, "breakeven_hours": 14.3}},
+            {"symbol": "LOW", "oi_usd": 4_000_000, "best_cross_arb": {"long_venue": "BinPerp", "short_venue": "HlPerp", "spread_apr_pct": 12.0, "breakeven_hours": 131.0}},
+        ],
+    }
+    selected = radar.select_alerts(mock_f, pm_res, min_spread_apr=50.0, max_breakeven_hours=48.0, min_bond_apr=40.0)
+    kinds = sorted(a["kind"] for a in selected)
+    assert kinds == ["bond", "funding", "negrisk"], kinds
+    state_file = os.path.join(tmp_dir, "alert_state.json")
+    t0 = 1_795_000_000.0
+    fresh1, sup1 = radar.filter_cooldown(selected, state_file, cooldown_min=60.0, now_ts=t0, persist=True)
+    assert len(fresh1) == 3 and sup1 == 0
+    fresh2, sup2 = radar.filter_cooldown(selected, state_file, cooldown_min=60.0, now_ts=t0 + 1800.0, persist=True)
+    assert len(fresh2) == 0 and sup2 == 3
+    fresh3, sup3 = radar.filter_cooldown(selected, state_file, cooldown_min=60.0, now_ts=t0 + 3605.0, persist=True)
+    assert len(fresh3) == 3 and sup3 == 0
+    msg = radar.format_alert_message(fresh3, mock_f["observed_utc"])
+    dry = radar.dispatch_alerts(msg, fresh3, webhook_url="https://example.invalid/hook", dry_run=True)
+    assert dry["dry_run"] is True and dry["alert_count"] == 3 and dry["targets"] == ["webhook"]
+    print("  Alert selector & cooldown OK")
 finally:
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
