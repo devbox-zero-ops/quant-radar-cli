@@ -234,13 +234,15 @@ def fetch_polymarket_opportunities(limit_events: int = 40, min_vol_usd: float = 
     return analyze_polymarket_events(events, min_vol_usd=min_vol_usd)
 
 
-def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equity: float = 1000.0, max_positions: int = 3, min_entry_apr: float = 25.0, exit_apr: float = 8.0, rt_fee_bps: float = DEFAULT_CROSS_VENUE_RT_BPS, confirm_exit_ticks: int = 2):
+def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equity: float = 1000.0, max_positions: int = 3, min_entry_apr: float = 25.0, exit_apr: float = 8.0, rt_fee_bps: float = DEFAULT_CROSS_VENUE_RT_BPS, confirm_exit_ticks: int = 2, emergency_exit_apr: float = -25.0, max_entry_apr: float = 500.0):
     """
     Maintain a realistic delta-neutral cross-venue funding paper portfolio on disk.
     - Deducts half of round-trip taker fee on open and half on close.
     - Accrues real funding spread cashflow strictly over real wall-clock elapsed hours.
     - Requires `confirm_exit_ticks` consecutive valid ticks below `exit_apr` before closing
       to avoid whipsaw exits on UTC funding-interval rollover resets; never closes on missing quotes.
+    - Closes immediately (bypassing hysteresis) on severe negative sign-inversions
+      (`cur_spread_apr <= emergency_exit_apr`), and skips extreme spike regimes above `max_entry_apr` (> 0).
     - Zero real funds risked; strictly empirical strategy validation.
     """
     now_ts = datetime.now(timezone.utc).timestamp()
@@ -298,7 +300,10 @@ def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equ
         pos["last_mark_utc"] = now_iso
         pos["last_spread_apr_pct"] = cur_spread_apr
         state["total_funding_accrued_usd"] = round(state["total_funding_accrued_usd"] + accrued, 6)
-        if cur_spread_apr < exit_apr:
+        if cur_spread_apr <= emergency_exit_apr:
+            pos["below_exit_ticks"] = int(pos.get("below_exit_ticks", 0)) + 1
+            to_close.append((sym, f"emergency sign-inversion stop: spread {cur_spread_apr}% <= {emergency_exit_apr}%"))
+        elif cur_spread_apr < exit_apr:
             low_ticks = int(pos.get("below_exit_ticks", 0)) + 1
             pos["below_exit_ticks"] = low_ticks
             if low_ticks >= max(1, int(confirm_exit_ticks)):
@@ -327,6 +332,8 @@ def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equ
         sym = row["symbol"]
         arb = row["best_cross_arb"]
         if sym in state["open_positions"] or arb["spread_apr_pct"] < min_entry_apr:
+            continue
+        if max_entry_apr > 0 and arb["spread_apr_pct"] > max_entry_apr:
             continue
         alloc = round(state["initial_equity_usd"] / max_positions, 2)
         if state["cash_usd"] < alloc:
@@ -572,7 +579,9 @@ def main():
     p_sim.add_argument("--ledger", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_ledger.json"))
     p_sim.add_argument("--equity", type=float, default=1000.0)
     p_sim.add_argument("--min-apr", type=float, default=25.0)
+    p_sim.add_argument("--max-entry-apr", type=float, default=500.0)
     p_sim.add_argument("--exit-apr", type=float, default=8.0)
+    p_sim.add_argument("--emergency-exit-apr", type=float, default=-25.0)
     p_sim.add_argument("--confirm-exit-ticks", type=int, default=2)
 
     p_d = sub.add_parser("digest")
@@ -596,7 +605,16 @@ def main():
         print(json.dumps(fetch_polymarket_opportunities(args.limit, args.min_vol), ensure_ascii=False, indent=2))
     elif args.cmd == "paper":
         snap = fetch_hyperliquid_funding()
-        st = update_paper_portfolio(args.ledger, snap, virtual_equity=args.equity, min_entry_apr=args.min_apr, exit_apr=args.exit_apr, confirm_exit_ticks=args.confirm_exit_ticks)
+        st = update_paper_portfolio(
+            args.ledger,
+            snap,
+            virtual_equity=args.equity,
+            min_entry_apr=args.min_apr,
+            exit_apr=args.exit_apr,
+            confirm_exit_ticks=args.confirm_exit_ticks,
+            emergency_exit_apr=args.emergency_exit_apr,
+            max_entry_apr=args.max_entry_apr,
+        )
         print(json.dumps(st, ensure_ascii=False, indent=2))
     elif args.cmd == "digest":
         f_snap = fetch_hyperliquid_funding()
