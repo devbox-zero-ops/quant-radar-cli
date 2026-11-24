@@ -72,17 +72,23 @@ try:
     }
     st_mid = radar.update_paper_portfolio(ledger, snap_mid, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0)
     assert "TEST" in st_mid["open_positions"] and st_mid["open_positions"]["TEST"]["accrued_funding_usd"] > 0
-    # Simulate 24h elapsed and spread collapsing below exit_apr
-    st_mid["open_positions"]["TEST"]["last_mark_ts"] -= 24 * 3600
+    # Verify missing quotes do not trigger a false exit
+    snap_missing = {"top_cross_venue_arb": [], "top_single_hl_funding": [], "all_cross_venue_by_symbol": {}, "all_predicted_venues": {}}
+    st_miss = radar.update_paper_portfolio(ledger, snap_missing, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0, confirm_exit_ticks=2)
+    assert "TEST" in st_miss["open_positions"] and st_miss["open_positions"]["TEST"]["missing_quote_ticks"] == 1
+    # Simulate 24h elapsed and 1st tick below exit_apr (held by hysteresis), then 2nd tick confirms close
+    st_miss["open_positions"]["TEST"]["last_mark_ts"] -= 24 * 3600
     with open(ledger, "w", encoding="utf-8") as f:
-        json.dump(st_mid, f)
+        json.dump(st_miss, f)
     snap_close = {
         "top_cross_venue_arb": [
             {"symbol": "TEST", "best_cross_arb": {"long_venue": "BybitPerp", "short_venue": "HlPerp", "spread_apr_pct": 2.0, "breakeven_hours": 788.4}}
         ],
         "top_single_hl_funding": [],
     }
-    st2 = radar.update_paper_portfolio(ledger, snap_close, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0)
+    st_hold = radar.update_paper_portfolio(ledger, snap_close, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0, confirm_exit_ticks=2)
+    assert "TEST" in st_hold["open_positions"] and st_hold["open_positions"]["TEST"]["below_exit_ticks"] == 1
+    st2 = radar.update_paper_portfolio(ledger, snap_close, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0, confirm_exit_ticks=2)
     assert "TEST" not in st2["open_positions"] and len(st2["closed_trades"]) == 1
     assert st2["closed_trades"][0]["exit_fee_usd"] > 0
     print("  Paper-trading lifecycle OK: closed net_pnl=", st2["closed_trades"][0]["net_pnl_usd"])
