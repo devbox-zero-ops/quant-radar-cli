@@ -375,6 +375,168 @@ def format_digest(funding: dict, poly: dict) -> str:
     return "\n".join(lines)
 
 
+def select_alerts(
+    funding: dict,
+    poly: dict,
+    min_spread_apr: float = 50.0,
+    max_breakeven_hours: float = 48.0,
+    min_bond_apr: float = 40.0,
+) -> list:
+    """Filter funding spreads, NegRisk deviations, and short-dated bonds into structured alert records."""
+    alerts = []
+    for r in funding.get("top_cross_venue_arb", []):
+        a = r.get("best_cross_arb") or {}
+        spread = float(a.get("spread_apr_pct") or 0.0)
+        be = float(a.get("breakeven_hours") or float("inf"))
+        if spread >= min_spread_apr and be <= max_breakeven_hours:
+            alerts.append({
+                "key": f"funding:{r['symbol']}:{a['long_venue']}:{a['short_venue']}",
+                "kind": "funding",
+                "headline": (
+                    f"[FUNDING] {r['symbol']} {spread:+.1f}% APR "
+                    f"(Long {a['long_venue']} / Short {a['short_venue']}, BE={be}h, OI=${r['oi_usd']/1e6:.1f}M)"
+                ),
+                "metrics": {
+                    "symbol": r["symbol"],
+                    "spread_apr_pct": spread,
+                    "breakeven_hours": be,
+                    "long_venue": a["long_venue"],
+                    "short_venue": a["short_venue"],
+                    "oi_usd": r["oi_usd"],
+                },
+            })
+
+    for nr in poly.get("negrisk_sum_deviations", []):
+        alerts.append({
+            "key": f"negrisk:{nr.get('url') or nr.get('event', '')[:60]}",
+            "kind": "negrisk",
+            "headline": f"[NEGRISK] {nr['event'][:65]} | sum={nr['yes_sum']} ({nr['raw_edge_pct']:+.2f}% {nr['direction']})",
+            "metrics": nr,
+        })
+
+    for b in poly.get("short_dated_high_prob_bonds", []):
+        apr = float(b.get("annualized_apr_pct") or 0.0)
+        if apr >= min_bond_apr:
+            alerts.append({
+                "key": f"bond:{b['side']}:{b['question'][:60]}",
+                "kind": "bond",
+                "headline": f"[BOND] {b['side']} @{b['price']:.3f} | {b['days_to_expiry']}d | {apr:.1f}% APR | {b['question'][:65]}",
+                "metrics": b,
+            })
+
+    return alerts
+
+
+def filter_cooldown(
+    alerts: list,
+    state_path: str,
+    cooldown_min: float = 60.0,
+    now_ts: float = None,
+    persist: bool = True,
+):
+    """Suppress alerts already emitted within cooldown_min; returns (fresh_alerts, suppressed_count)."""
+    now = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
+    state = {}
+    if state_path and os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    state = loaded
+        except Exception:
+            state = {}
+
+    cooldown_sec = max(0.0, float(cooldown_min) * 60.0)
+    fresh = []
+    suppressed = 0
+    for item in alerts:
+        last = float(state.get(item["key"], 0.0) or 0.0)
+        if last > 0.0 and (now - last) < cooldown_sec:
+            suppressed += 1
+        else:
+            fresh.append(item)
+
+    if persist and state_path and fresh:
+        for item in fresh:
+            state[item["key"]] = now
+        # Prune stale keys older than 7 days so state file stays compact
+        cutoff = now - 7 * 86400.0
+        state = {k: v for k, v in state.items() if float(v or 0.0) >= cutoff}
+        os.makedirs(os.path.dirname(os.path.abspath(state_path)), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+
+    return fresh, suppressed
+
+
+def format_alert_message(alerts: list, observed_utc: str) -> str:
+    lines = [f"Quant Radar Alert ({observed_utc}) — {len(alerts)} signal(s):"]
+    for a in alerts[:10]:
+        lines.append(f"- {a['headline']}")
+    return "\n".join(lines)
+
+
+def dispatch_alerts(
+    message: str,
+    alerts: list,
+    webhook_url: str = "",
+    telegram_token: str = "",
+    telegram_chat_id: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """Deliver formatted alerts to a generic JSON webhook and/or Telegram Bot API (zero deps)."""
+    targets = []
+    if webhook_url:
+        targets.append("webhook")
+    if telegram_token and telegram_chat_id:
+        targets.append("telegram")
+
+    if dry_run or not alerts:
+        return {
+            "dry_run": bool(dry_run),
+            "sent": False,
+            "targets": targets,
+            "alert_count": len(alerts),
+            "message": message if alerts else "",
+            "alerts": alerts,
+        }
+
+    results = {}
+    if webhook_url:
+        payload = {"content": message, "text": message, "alerts": alerts}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={"User-Agent": UA, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            results["webhook_status"] = getattr(r, "status", 200)
+
+    if telegram_token and telegram_chat_id:
+        tg_url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+        tg_payload = {"chat_id": telegram_chat_id, "text": message, "disable_web_page_preview": True}
+        data = json.dumps(tg_payload).encode("utf-8")
+        req = urllib.request.Request(
+            tg_url,
+            data=data,
+            headers={"User-Agent": UA, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read().decode("utf-8", errors="replace"))
+            results["telegram_ok"] = bool(body.get("ok"))
+
+    return {
+        "dry_run": False,
+        "sent": bool(results),
+        "targets": targets,
+        "alert_count": len(alerts),
+        "delivery": results,
+    }
+
+
 def main():
     p = argparse.ArgumentParser(description="quant-radar-cli — Crypto Funding & Polymarket Arbitrage Scanner")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -397,6 +559,17 @@ def main():
     p_d = sub.add_parser("digest")
     p_d.add_argument("--json", action="store_true")
 
+    p_n = sub.add_parser("notify")
+    p_n.add_argument("--min-spread-apr", type=float, default=50.0)
+    p_n.add_argument("--max-breakeven-hours", type=float, default=48.0)
+    p_n.add_argument("--min-bond-apr", type=float, default=40.0)
+    p_n.add_argument("--cooldown-min", type=float, default=60.0)
+    p_n.add_argument("--state-file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_state.json"))
+    p_n.add_argument("--webhook", default=os.environ.get("QUANT_RADAR_WEBHOOK", ""))
+    p_n.add_argument("--telegram-token", default=os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+    p_n.add_argument("--telegram-chat-id", default=os.environ.get("TELEGRAM_CHAT_ID", ""))
+    p_n.add_argument("--dry-run", action="store_true")
+
     args = p.parse_args()
     if args.cmd == "funding":
         print(json.dumps(fetch_hyperliquid_funding(args.min_oi, args.min_vol, args.rt_fee_bps), ensure_ascii=False, indent=2))
@@ -413,6 +586,34 @@ def main():
             print(json.dumps({"funding": f_snap, "polymarket": p_snap}, ensure_ascii=False, indent=2))
         else:
             print(format_digest(f_snap, p_snap))
+    elif args.cmd == "notify":
+        f_snap = fetch_hyperliquid_funding()
+        p_snap = fetch_polymarket_opportunities()
+        raw_alerts = select_alerts(
+            f_snap,
+            p_snap,
+            min_spread_apr=args.min_spread_apr,
+            max_breakeven_hours=args.max_breakeven_hours,
+            min_bond_apr=args.min_bond_apr,
+        )
+        fresh, suppressed = filter_cooldown(
+            raw_alerts,
+            state_path=args.state_file,
+            cooldown_min=args.cooldown_min,
+            persist=(not args.dry_run and bool(args.webhook or (args.telegram_token and args.telegram_chat_id))),
+        )
+        msg = format_alert_message(fresh, f_snap["observed_utc"]) if fresh else ""
+        res = dispatch_alerts(
+            msg,
+            fresh,
+            webhook_url=args.webhook,
+            telegram_token=args.telegram_token,
+            telegram_chat_id=args.telegram_chat_id,
+            dry_run=args.dry_run,
+        )
+        res["matched_total"] = len(raw_alerts)
+        res["suppressed_by_cooldown"] = suppressed
+        print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
