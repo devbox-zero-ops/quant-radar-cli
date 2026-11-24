@@ -91,7 +91,24 @@ try:
     st2 = radar.update_paper_portfolio(ledger, snap_close, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0, confirm_exit_ticks=2)
     assert "TEST" not in st2["open_positions"] and len(st2["closed_trades"]) == 1
     assert st2["closed_trades"][0]["exit_fee_usd"] > 0
-    print("  Paper-trading lifecycle OK: closed net_pnl=", st2["closed_trades"][0]["net_pnl_usd"])
+    # Verify max_entry_apr skips extreme spike regimes, and emergency_exit_apr closes severe sign inversions on tick 1
+    snap_spike = {
+        "top_cross_venue_arb": [
+            {"symbol": "SPIKE", "best_cross_arb": {"long_venue": "HlPerp", "short_venue": "BybitPerp", "spread_apr_pct": 1800.0, "breakeven_hours": 0.9}},
+            {"symbol": "STEADY", "best_cross_arb": {"long_venue": "HlPerp", "short_venue": "BybitPerp", "spread_apr_pct": 80.0, "breakeven_hours": 19.7}},
+        ],
+        "top_single_hl_funding": [],
+    }
+    st_sp = radar.update_paper_portfolio(ledger, snap_spike, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0, confirm_exit_ticks=2, emergency_exit_apr=-25.0, max_entry_apr=500.0)
+    assert "SPIKE" not in st_sp["open_positions"] and "STEADY" in st_sp["open_positions"]
+    snap_invert = {
+        "top_cross_venue_arb": [],
+        "top_single_hl_funding": [],
+        "all_predicted_venues": {"STEADY": {"HlPerp": {"apr_pct": 200.0}, "BybitPerp": {"apr_pct": -100.0}}},
+    }
+    st_inv = radar.update_paper_portfolio(ledger, snap_invert, virtual_equity=900.0, max_positions=3, min_entry_apr=25.0, exit_apr=8.0, confirm_exit_ticks=2, emergency_exit_apr=-25.0, max_entry_apr=500.0)
+    assert "STEADY" not in st_inv["open_positions"] and "emergency sign-inversion" in st_inv["closed_trades"][-1]["close_reason"]
+    print("  Paper-trading lifecycle + emergency stop + spike filter OK: closed net_pnl=", st2["closed_trades"][0]["net_pnl_usd"])
 
     print("3b. Unit test alert selection, cooldown suppression & dry-run dispatch...")
     mock_f = {
