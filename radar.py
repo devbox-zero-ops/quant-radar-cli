@@ -139,6 +139,7 @@ def fetch_hyperliquid_funding(min_oi_usd: float = 500_000.0, min_vol_usd: float 
         "filters": {"min_oi_usd": min_oi_usd, "min_vol_usd": min_vol_usd, "rt_fee_bps": rt_fee_bps},
         "top_cross_venue_arb": cross_top[:12],
         "top_single_hl_funding": single_top[:12],
+        "all_cross_venue_by_symbol": {r["symbol"]: r for r in rows if r.get("best_cross_arb")},
     }
 
 
@@ -258,7 +259,9 @@ def update_paper_portfolio(ledger_path: str, funding_snapshot: dict, virtual_equ
             "snapshots_count": 0,
         }
 
-    by_sym = {r["symbol"]: r for r in funding_snapshot.get("top_cross_venue_arb", [])}
+    by_sym = dict(funding_snapshot.get("all_cross_venue_by_symbol") or {})
+    for r in funding_snapshot.get("top_cross_venue_arb", []):
+        by_sym.setdefault(r["symbol"], r)
     for r in funding_snapshot.get("top_single_hl_funding", []):
         by_sym.setdefault(r["symbol"], r)
 
